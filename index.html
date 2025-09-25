@@ -1,0 +1,341 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rialo Logo Racing Game</title>
+  <style>
+    :root{--bg:#111;--road:#ded8cb;--panel:#cbe54e}
+    html,body{height:100%;margin:0;background:var(--bg);font-family:system-ui,Segoe UI,Roboto,monospace}
+    #wrapper{display:flex;flex-direction:column;align-items:center;padding:20px 0}
+    canvas{background:var(--road);display:block;border-radius:8px;box-shadow:0 8px 30px rgba(0,0,0,.6)}
+    #hud{position:fixed;left:12px;top:12px;color:#111;font-weight:700}
+    #hud div{background:#fff;padding:8px 12px;border-radius:6px;margin-bottom:8px}
+    #bottomHud{position:fixed;left:12px;bottom:12px;color:#111}
+    #pass{background:var(--panel);padding:8px 12px;border-radius:8px;cursor:pointer;user-select:none}
+    /* Mobile touch buttons */
+    .touch-btn{position:fixed;bottom:24px;width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.9);box-shadow:0 6px 18px rgba(0,0,0,.3);user-select:none}
+    #leftBtn{left:20px} #rightBtn{left:100px}
+    #tapCenter{right:24px;bottom:24px;width:84px;height:40px;border-radius:18px;background:rgba(255,255,255,.95);display:flex;align-items:center;justify-content:center}
+
+    /* overlays */
+    .overlay{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.7);color:#fff;padding:16px 20px;border-radius:10px;text-align:center}
+    .hidden{display:none}
+    button{cursor:pointer}
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="score">Score: 0</div>
+    <div id="speed">Speed: 5</div>
+  </div>
+  <div id="bottomHud">
+    <div id="pass">⏭ Pass</div>
+  </div>
+
+  <div id="wrapper">
+    <canvas id="gameCanvas" width="360" height="640"></canvas>
+  </div>
+
+  <!-- Touch controls (visible on small screens) -->
+  <div id="leftBtn" class="touch-btn" style="display:none">◀</div>
+  <div id="rightBtn" class="touch-btn" style="display:none">▶</div>
+  <div id="tapCenter" style="display:none">Tap = Brake</div>
+
+  <div id="startOverlay" class="overlay">
+    <h2>Rialo — Logo Racing</h2>
+    <p>Use ◀ / ▶ or swipe to move lanes. Avoid obstacles and score points.</p>
+    <button id="startBtn">Start Game</button>
+  </div>
+
+  <div id="gameOverOverlay" class="overlay hidden">
+    <h2>Game Over</h2>
+    <p id="finalScore">Score: 0</p>
+    <button id="restartBtn">Restart</button>
+  </div>
+
+  <script>
+    // ---------------------- CONFIG ----------------------
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const ROAD = {x:80, width:200, height:canvas.height};
+    const LANES = 3;
+    const laneWidth = ROAD.width / LANES;
+    const laneCenters = Array.from({length:LANES}, (_,i) => ROAD.x + laneWidth/2 + i*laneWidth);
+
+    // Assets (drop your own images in same folder or change paths)
+    const assets = {
+      player: 'player.png', // put your 1000274025.jpg as player.png, or edit path
+      obstacle: 'obstacle.png'
+    };
+
+    // Game state
+    let state = {
+      running: false,
+      speed: 5,           // base speed
+      score: 0,
+      playerLane: 1,      // 0..LANES-1
+      playerImg: null,
+      obstacleImg: null,
+      obstacles: [],
+      lastSpawn: 0,
+      spawnInterval: 1200, // ms
+      lastFrame: 0,
+      roadOffset: 0,
+      difficultyTimer: 0
+    };
+
+    // Player visual size
+    const PLAYER = {w:64, h:64};
+
+    // ------------------- INPUT -------------------
+    let leftDown=false, rightDown=false;
+    document.addEventListener('keydown', e => {
+      if(e.key === 'ArrowLeft') leftDown = true;
+      if(e.key === 'ArrowRight') rightDown = true;
+      if(e.key === 'a') leftDown = true;
+      if(e.key === 'd') rightDown = true;
+    });
+    document.addEventListener('keyup', e => {
+      if(e.key === 'ArrowLeft') leftDown = false;
+      if(e.key === 'ArrowRight') rightDown = false;
+      if(e.key === 'a') leftDown = false;
+      if(e.key === 'd') rightDown = false;
+    });
+
+    // Touch controls: detect small screens and show buttons
+    function setupTouchControls(){
+      const leftBtn = document.getElementById('leftBtn');
+      const rightBtn = document.getElementById('rightBtn');
+      const tapCenter = document.getElementById('tapCenter');
+      if(window.innerWidth < 700){
+        leftBtn.style.display = 'flex';
+        rightBtn.style.display = 'flex';
+        tapCenter.style.display = 'flex';
+      }
+      leftBtn.addEventListener('touchstart', e=>{ e.preventDefault(); leftDown = true });
+      leftBtn.addEventListener('touchend', e=>{ e.preventDefault(); leftDown = false });
+      rightBtn.addEventListener('touchstart', e=>{ e.preventDefault(); rightDown = true });
+      rightBtn.addEventListener('touchend', e=>{ e.preventDefault(); rightDown = false });
+
+      // swipe support
+      let sx=null, sy=null;
+      canvas.addEventListener('touchstart', e=>{ sx = e.touches[0].clientX; sy = e.touches[0].clientY});
+      canvas.addEventListener('touchend', e=>{ if(sx==null) return; let ex = e.changedTouches[0].clientX; let dx = ex - sx; if(Math.abs(dx) > 30){ if(dx < 0) doMoveLeft(); else doMoveRight(); } sx=null; sy=null; });
+    }
+
+    function doMoveLeft(){ state.playerLane = Math.max(0, state.playerLane - 1); }
+    function doMoveRight(){ state.playerLane = Math.min(LANES-1, state.playerLane + 1); }
+
+    // ------------------- ASSET LOADING -------------------
+    function loadImage(src){
+      return new Promise(resolve => {
+        const i = new Image(); i.src = src;
+        i.onload = () => resolve(i);
+        i.onerror = () => resolve(null);
+      });
+    }
+
+    async function preload(){
+      state.playerImg = await loadImage(assets.player);
+      state.obstacleImg = await loadImage(assets.obstacle);
+    }
+
+    // ------------------- GAME LOGIC -------------------
+    function spawnObstacle(){
+      const lane = Math.floor(Math.random()*LANES);
+      const width = 48 + Math.random()*32;
+      const height = 48 + Math.random()*32;
+      const speed = state.speed + 1 + Math.random()*2;
+      state.obstacles.push({lane, x: laneCenters[lane] - width/2, y: -height, w: width, h: height, speed});
+    }
+
+    function update(dt){
+      // controls move lanes
+      if(leftDown) doMoveLeft();
+      if(rightDown) doMoveRight();
+
+      // update road offset for moving feeling
+      state.roadOffset += dt * state.speed * 0.08;
+      state.difficultyTimer += dt;
+
+      // spawn obstacles
+      if(performance.now() - state.lastSpawn > state.spawnInterval){
+        spawnObstacle();
+        state.lastSpawn = performance.now();
+      }
+
+      // move obstacles
+      for(let i = state.obstacles.length-1; i>=0; i--){
+        const ob = state.obstacles[i];
+        ob.y += ob.speed * dt * 0.06;
+        // occasional horizontal dodging behaviour
+        if(Math.random() < 0.002) ob.lateral = (Math.random()<0.5? -1: 1) * (Math.random()*0.3+0.1);
+        if(ob.lateral) ob.x += ob.lateral * dt * 0.02;
+
+        // if off screen, score and remove
+        if(ob.y > canvas.height + 200){ state.obstacles.splice(i,1); state.score += 10; }
+      }
+
+      // slowly increase speed every 10 seconds
+      if(state.difficultyTimer > 10000){ state.speed += 0.3; state.difficultyTimer = 0; state.spawnInterval = Math.max(500, state.spawnInterval - 40); }
+
+      // collision detection: player rectangle vs obstacles
+      const px = laneCenters[state.playerLane] - PLAYER.w/2;
+      const py = canvas.height - 140;
+      for(const ob of state.obstacles){
+        if(hitTest(px, py, PLAYER.w, PLAYER.h, ob.x, ob.y, ob.w, ob.h)){
+          // hit!
+          gameOver();
+          break;
+        }
+      }
+    }
+
+    function hitTest(x1,y1,w1,h1,x2,y2,w2,h2){
+      return !(x2 > x1 + w1 || x2 + w2 < x1 || y2 > y1 + h1 || y2 + h2 < y1);
+    }
+
+    function draw(){
+      // clear
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      // fill outer area
+      ctx.fillStyle = '#d9d6c7';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+
+      // draw road
+      ctx.fillStyle = '#e9e4d6';
+      ctx.fillRect(ROAD.x, 0, ROAD.width, canvas.height);
+
+      // draw side borders
+      ctx.fillStyle = '#bdb7a1';
+      ctx.fillRect(ROAD.x-6, 0, 6, canvas.height);
+      ctx.fillRect(ROAD.x + ROAD.width, 0, 6, canvas.height);
+
+      // dashed center line (animated)
+      ctx.strokeStyle = '#999';
+      ctx.lineWidth = 6;
+      ctx.setLineDash([30, 30]);
+      ctx.beginPath();
+      ctx.moveTo(ROAD.x + ROAD.width/2, - (state.roadOffset % 60));
+      ctx.lineTo(ROAD.x + ROAD.width/2, canvas.height + 60);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // lane separators (soft)
+      ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+      ctx.lineWidth = 2;
+      for(let i=1;i<LANES;i++){
+        const lx = ROAD.x + i*laneWidth;
+        ctx.beginPath(); ctx.moveTo(lx,0); ctx.lineTo(lx,canvas.height); ctx.stroke();
+      }
+
+      // draw obstacles
+      for(const ob of state.obstacles){
+        if(state.obstacleImg){
+          ctx.drawImage(state.obstacleImg, ob.x, ob.y, ob.w, ob.h);
+        } else {
+          ctx.fillStyle = '#c94c4c';
+          roundRect(ctx, ob.x, ob.y, ob.w, ob.h, 8, true, false);
+        }
+      }
+
+      // draw player (centered at lane)
+      const px = laneCenters[state.playerLane] - PLAYER.w/2;
+      const py = canvas.height - 140;
+      if(state.playerImg){
+        ctx.drawImage(state.playerImg, px, py, PLAYER.w, PLAYER.h);
+      } else {
+        // placeholder: circle + eyes
+        ctx.save(); ctx.translate(px + PLAYER.w/2, py + PLAYER.h/2);
+        ctx.fillStyle = '#2b6fb5'; ctx.beginPath(); ctx.arc(0,0,PLAYER.w/2,0,Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(-10,-6,6,0,Math.PI*2); ctx.arc(10,-6,6,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+
+      // HUD refreshed
+      document.getElementById('score').textContent = `Score: ${state.score}`;
+      document.getElementById('speed').textContent = `Speed: ${Math.round(state.speed)}`;
+    }
+
+    // ------------------- UTIL -------------------
+    function roundRect(ctx, x, y, w, h, r, fill, stroke){
+      if (typeof stroke === 'undefined') { stroke = true; }
+      if (typeof r === 'undefined') { r = 5; }
+      ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+      if(fill) ctx.fill(); if(stroke) ctx.stroke();
+    }
+
+    // ------------------- GAME CONTROL -------------------
+    function reset(){
+      state.obstacles = [];
+      state.score = 0;
+      state.speed = 5;
+      state.spawnInterval = 1200;
+      state.playerLane = 1;
+      state.lastSpawn = performance.now();
+      state.difficultyTimer = 0;
+    }
+
+    function startGame(){
+      reset();
+      state.running = true;
+      document.getElementById('startOverlay').classList.add('hidden');
+      document.getElementById('gameOverOverlay').classList.add('hidden');
+      state.lastFrame = performance.now();
+      requestAnimationFrame(tick);
+    }
+
+    function gameOver(){
+      state.running = false;
+      document.getElementById('finalScore').textContent = `Score: ${state.score}`;
+      document.getElementById('gameOverOverlay').classList.remove('hidden');
+    }
+
+    function tick(now){
+      if(!state.running) return;
+      const dt = now - state.lastFrame; state.lastFrame = now;
+      update(dt);
+      draw();
+      requestAnimationFrame(tick);
+    }
+
+    // ------------------ STARTUP ------------------
+    (async function(){
+      await preload();
+      setupTouchControls();
+      // start overlay button
+      document.getElementById('startBtn').addEventListener('click', ()=> startGame());
+      document.getElementById('restartBtn').addEventListener('click', ()=> startGame());
+      document.getElementById('pass').addEventListener('click', ()=> alert('Level passed!'));
+
+      // adapt keyboard to lane changes (instant) for arcade feel
+      setInterval(()=>{
+        if(leftDown){ doMoveLeft(); leftDown = false; }
+        if(rightDown){ doMoveRight(); rightDown = false; }
+      }, 100);
+
+      // show start overlay
+      document.getElementById('startOverlay').classList.remove('hidden');
+
+      // initial draw so canvas looks populated
+      draw();
+
+      // responsive canvas scaling
+      function resize(){
+        const scale = Math.min((window.innerWidth - 40) / canvas.width, (window.innerHeight - 120) / canvas.height, 1);
+        canvas.style.width = canvas.width * scale + 'px';
+        canvas.style.height = canvas.height * scale + 'px';
+      }
+      window.addEventListener('resize', resize); resize();
+    })();
+
+    // ------------------ HELPERS / QUICK CHANGES ------------------
+    // If you want to use the image the original HTML used (1000274025.jpg), change assets.player = '1000274025.jpg' above.
+
+  </script>
+</body>
+</html>
+
